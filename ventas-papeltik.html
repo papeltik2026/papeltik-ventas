@@ -190,7 +190,7 @@
 const CONFIG = {
   // URL de tu Apps Script publicado como Web App (ver guía de configuración).
   // Debe terminar en "/exec".
-  scriptUrl: "https://script.google.com/macros/s/AKfycbzGR8EcJ0LL1ByBMhk1vC9jx1vyFG4tGxZNky5fv-bYExhcrLdJSPiPw7q4wNvZGNNl1A/exec",
+  scriptUrl: "https://script.google.com/macros/s/AKfycbw7P1YvWC0TBri-9ggWrKVVphJi5efjJT5QZqgu1CZgCAvMU2x8n4Jw3ycX8zKmfiA9/exec",
 
   vendedores: ["Alejandro T", "Rafael T", "Valentina y Eduardo"],
 
@@ -320,6 +320,7 @@ async function refreshCatalog() {
     costoUnit: Number(p.costoUnit || 0),
     tarifaPaquete: Number(p.tarifaPaquete || 0),
     cantUnitPorPaquete: Number(p.cantUnitPorPaquete || 0),
+    costoPaquete: Number(p.costoPaquete || 0),
   }));
   localStorage.setItem(FALLBACK_CATALOG_KEY, JSON.stringify(catalog));
 }
@@ -339,6 +340,7 @@ function loadFallbackCatalog() {
     costoUnit: 0, // el respaldo local no trae costo; se completa al conectar con Google Sheets
     tarifaPaquete: 0,       // el respaldo local no trae precio de paquete; sin conexión no se ofrece esa opción
     cantUnitPorPaquete: 0,
+    costoPaquete: 0,
   }));
 }
 
@@ -488,6 +490,19 @@ function addLineToCart() {
   }
 
   const subtotalLinea = qty * precio;
+
+  // Costo real de la línea: si es venta por paquete, se toma directo de
+  // "Costo Paquete" (costo de comprar UN paquete) × número de paquetes —
+  // no derivado indirectamente del Costo Unit. Si por algún producto no
+  // hay Costo Paquete cargado, se usa el Costo Unit como respaldo para no
+  // dejar el costo en cero.
+  const costoTotalLinea = (usaPaquete && Number(p.costoPaquete) > 0)
+    ? qty * Number(p.costoPaquete)
+    : unidadesLinea * (p.costoUnit || 0);
+  // Costo por unidad real equivalente, para que en Google Sheets
+  // Cantidad (unidades) × Costo Unit = Costo Total siga siendo exacto.
+  const costoUnitLinea = unidadesLinea > 0 ? costoTotalLinea / unidadesLinea : 0;
+
   cart.push({
     producto: p.producto,
     modo: usaPaquete ? "paquete" : "unidad",
@@ -496,8 +511,8 @@ function addLineToCart() {
     precioMostrado: precio,           // precio por paquete o por unidad, para carrito/recibo
     precioUnit: subtotalLinea / unidadesLinea, // precio por unidad real equivalente, para Google Sheets
     subtotal: subtotalLinea,
-    costoUnit: p.costoUnit || 0,
-    costoTotal: unidadesLinea * (p.costoUnit || 0),
+    costoUnit: costoUnitLinea,
+    costoTotal: costoTotalLinea,
   });
 
   clearSelectedProduct();
