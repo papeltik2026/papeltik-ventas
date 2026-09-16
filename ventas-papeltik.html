@@ -129,6 +129,12 @@
     <button id="btnRetrySync">Reintentar</button>
   </div>
 
+  <!-- ================= SEDE ================= -->
+  <div class="card">
+    <h2>Sede</h2>
+    <div class="vendedores" id="sedes"></div>
+  </div>
+
   <!-- ================= VENDEDOR ================= -->
   <div class="card">
     <h2>Vendedor</h2>
@@ -194,6 +200,11 @@ const CONFIG = {
 
   vendedores: ["Alejandro T", "Rafael T", "Valentina y Eduardo"],
 
+  // Sedes de inventario. Deben escribirse EXACTAMENTE igual (mismos acentos)
+  // a como están en la columna "Ubicación" de la hoja Inventario — el
+  // catálogo y el descuento de existencias se filtran por este valor.
+  sedes: ["Suba", "Colina", "Zipaquirá"],
+
   // Umbral por defecto para la alerta de "stock bajo" en el Tablero.
   // Una vez creado el Tablero, también se puede editar directamente en la celda B26 de esa hoja.
   umbralStockBajo: 10,
@@ -206,18 +217,27 @@ const CONFIG = {
    ========================================================================= */
 let conectado = false;
 let catalog = [];                  // [{producto, precio, disponible, costoUnit, tarifaPaquete, cantUnitPorPaquete}]
-let vendedorSeleccionado = null;
+let vendedorSeleccionado = null;   // solo identifica quién vendió (para el registro interno)
+let sedeSeleccionada = null;       // de dónde se descuenta inventario — independiente del vendedor
 let productoSeleccionado = null;   // referencia a un item de catalog
 let modoVenta = "unidad";          // "unidad" | "paquete"
 let cart = [];                     // [{producto, cantidad, precioUnit, subtotal}]
 
-// Vendedor real -> nombre de sede que se muestra en el recibo (Solicitud del
-// negocio: el cliente no debe ver el nombre de la persona, solo la sede).
-const SEDE_POR_VENDEDOR = {
-  "Alejandro T": "Papeltik Bogotá",
-  "Rafael T": "Papeltik Bogotá",
-  "Valentina y Eduardo": "Papeltik Zipaquirá",
+// Sede real (Ubicación de Inventario) -> nombre que se muestra en el recibo
+// (Solicitud del negocio: el cliente no debe ver de qué local puntual salió
+// la venta si son la misma ciudad, solo la marca/ciudad general).
+const SEDE_DISPLAY = {
+  "Suba": "Papeltik Bogotá",
+  "Colina": "Papeltik Bogotá",
+  "Zipaquirá": "Papeltik Zipaquirá",
 };
+
+// NOTA (multi-sede): la sede se elige de forma independiente al vendedor
+// (tarjeta "Sede" en la app). El vendedor queda solo como dato de quién
+// hizo la venta; la sede es lo único que determina qué catálogo se ve y de
+// dónde se descuentan existencias. El HTML manda ambos datos por separado
+// al backend (Code.gs), que ya no intenta deducir la sede a partir del
+// vendedor.
 
 function esPaqueteValido(p) {
   return !!(p && Number(p.cantUnitPorPaquete) > 0 && Number(p.tarifaPaquete) > 0);
@@ -237,11 +257,12 @@ const CATALOGO_RESPALDO = [{"producto": "Block Fama Escolar Cuadros Carta 70H", 
 window.addEventListener("DOMContentLoaded", init);
 
 async function init() {
+  renderSedes();
   renderVendedores();
-  loadFallbackCatalog();
   renderPendingBanner();
   wireStaticEvents();
   renderCart();
+  setSearchEnabled(false); // hasta que se elija sede no se sabe qué inventario mostrar
 
   if (CONFIG.scriptUrl.includes("PEGA_AQUI")) {
     document.getElementById("setupWarning").style.display = "block";
@@ -249,15 +270,21 @@ async function init() {
     return; // no intentamos conectar sin scriptUrl
   }
 
+  // No cargamos catálogo todavía (las existencias dependen de la sede
+  // elegida, no del vendedor). Solo verificamos conexión y sincronizamos
+  // ventas pendientes de sesiones anteriores.
   setConnStatus(false, "Conectando…");
   try {
-    await refreshCatalog();
-    setConnStatus(true, "Conectado a Google Sheets");
+    const res = await fetch(CONFIG.scriptUrl + "?action=ping", { method: "GET" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "Error desconocido");
+    setConnStatus(true, "Conectado — selecciona la sede");
     await retryPendingSync();
   } catch (e) {
     console.error(e);
-    setConnStatus(false, "Sin conexión — usando datos guardados");
-    toast("No se pudo conectar con Google Sheets. Se usará el último inventario guardado.");
+    setConnStatus(false, "Sin conexión — elige la sede para reintentar");
+    toast("No se pudo conectar con Google Sheets todavía. Se reintentará al elegir la sede.");
   }
 }
 
@@ -285,7 +312,9 @@ function actualizarEtiquetaCantidad() {
 }
 
 /* =========================================================================
-   VENDEDORES
+   VENDEDOR — solo identifica quién hizo la venta (para el registro interno
+   y el recibo). NO afecta el catálogo ni las existencias: eso lo controla
+   únicamente la SEDE (ver abajo).
    ========================================================================= */
 function renderVendedores() {
   const box = document.getElementById("vendedores");
@@ -306,10 +335,64 @@ function renderVendedores() {
 }
 
 /* =========================================================================
+   SEDE — de dónde se descuenta inventario. Es independiente del vendedor:
+   cualquier vendedor puede vender desde cualquier sede (por ejemplo, si está
+   cubriendo otro local ese día). Al elegir sede se recarga el catálogo
+   filtrado a esa ubicación: existencias, precios y costos son siempre los
+   de esa sede, nunca el total de todas las sedes.
+   ========================================================================= */
+function renderSedes() {
+  const box = document.getElementById("sedes");
+  box.innerHTML = "";
+  const isOdd = CONFIG.sedes.length % 2 === 1;
+  CONFIG.sedes.forEach((s, idx) => {
+    const b = document.createElement("button");
+    b.className = "vbtn";
+    if (isOdd && idx === CONFIG.sedes.length - 1) b.classList.add("span2");
+    b.textContent = s;
+    b.onclick = () => seleccionarSede(s, b, box);
+    box.appendChild(b);
+  });
+}
+
+async function seleccionarSede(s, btnEl, box) {
+  if (cart.length) {
+    toast("Cambiaste de sede: se vació la venta en curso (era de otra sede).");
+    cart = [];
+  }
+  sedeSeleccionada = s;
+  [...box.children].forEach((c) => c.classList.remove("sel"));
+  btnEl.classList.add("sel");
+  clearSelectedProduct();
+  document.getElementById("searchInput").value = "";
+  document.getElementById("searchResults").style.display = "none";
+  renderCart();
+
+  setSearchEnabled(false);
+  loadFallbackCatalog(s); // por si no hay conexión, muestra lo último guardado DE ESTA sede
+  setConnStatus(false, "Cargando inventario de " + s + "…");
+  try {
+    await refreshCatalog(s);
+    setConnStatus(true, "Conectado a Google Sheets");
+    setSearchEnabled(true);
+  } catch (e) {
+    console.error(e);
+    setConnStatus(false, "Sin conexión — usando datos guardados");
+    setSearchEnabled(catalog.length > 0);
+    toast("No se pudo conectar con Google Sheets. Se usará el último inventario guardado de esta sede.");
+  }
+}
+
+/* =========================================================================
    CONEXIÓN Y CARGA DE INVENTARIO EN VIVO (Google Sheets vía Apps Script)
    ========================================================================= */
-async function refreshCatalog() {
-  const res = await fetch(CONFIG.scriptUrl + "?action=catalogo", { method: "GET" });
+function catalogCacheKey_(sede) {
+  return FALLBACK_CATALOG_KEY + ":" + sede;
+}
+
+async function refreshCatalog(sede) {
+  if (!sede) return; // sin sede no sabemos qué inventario mostrar
+  const res = await fetch(CONFIG.scriptUrl + "?action=catalogo&sede=" + encodeURIComponent(sede), { method: "GET" });
   if (!res.ok) throw new Error("HTTP " + res.status);
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "Error desconocido");
@@ -322,11 +405,11 @@ async function refreshCatalog() {
     cantUnitPorPaquete: Number(p.cantUnitPorPaquete || 0),
     costoPaquete: Number(p.costoPaquete || 0),
   }));
-  localStorage.setItem(FALLBACK_CATALOG_KEY, JSON.stringify(catalog));
+  localStorage.setItem(catalogCacheKey_(sede), JSON.stringify(catalog));
 }
 
-function loadFallbackCatalog() {
-  const cached = localStorage.getItem(FALLBACK_CATALOG_KEY);
+function loadFallbackCatalog(sede) {
+  const cached = sede ? localStorage.getItem(catalogCacheKey_(sede)) : null;
   if (cached) {
     try {
       catalog = JSON.parse(cached);
@@ -342,6 +425,15 @@ function loadFallbackCatalog() {
     cantUnitPorPaquete: 0,
     costoPaquete: 0,
   }));
+}
+
+function setSearchEnabled(enabled) {
+  const input = document.getElementById("searchInput");
+  input.disabled = !enabled;
+  input.placeholder = enabled ? "Buscar producto…" : "Primero selecciona un vendedor…";
+  if (!enabled) {
+    document.getElementById("searchResults").style.display = "none";
+  }
 }
 
 function setConnStatus(on, text) {
@@ -371,6 +463,12 @@ async function postVenta_(venta) {
 function onSearchInput(e) {
   const q = e.target.value.trim().toLowerCase();
   const box = document.getElementById("searchResults");
+  if (!sedeSeleccionada) {
+    box.style.display = "none";
+    box.innerHTML = "";
+    toast("Selecciona primero la sede.");
+    return;
+  }
   if (!q) {
     box.style.display = "none";
     box.innerHTML = "";
@@ -460,6 +558,10 @@ function updateLineTotal() {
    CARRITO / VENTA ACTUAL  ("Agregar a la venta" agrega la línea, puedes repetir)
    ========================================================================= */
 function addLineToCart() {
+  if (!sedeSeleccionada) {
+    toast("Selecciona primero la sede.");
+    return;
+  }
   if (!vendedorSeleccionado) {
     toast("Selecciona primero el vendedor.");
     return;
@@ -559,6 +661,10 @@ function renderCart() {
    CERRAR VENTA
    ========================================================================= */
 async function closeSale() {
+  if (!sedeSeleccionada) {
+    toast("Selecciona la sede antes de cerrar la venta.");
+    return;
+  }
   if (!vendedorSeleccionado) {
     toast("Selecciona el vendedor antes de cerrar la venta.");
     return;
@@ -574,7 +680,13 @@ async function closeSale() {
   const hora = now.toLocaleTimeString("es-CO");
   const totalVenta = cart.reduce((s, c) => s + c.subtotal, 0);
 
-  const venta = { ventaId, fecha, hora, vendedor: vendedorSeleccionado, items: [...cart], totalVenta };
+  const venta = {
+    ventaId, fecha, hora,
+    vendedor: vendedorSeleccionado,
+    sede: sedeSeleccionada,
+    items: [...cart],
+    totalVenta,
+  };
 
   await trySyncSale(venta);
   try {
@@ -586,12 +698,16 @@ async function closeSale() {
 
   cart = [];
   vendedorSeleccionado = null;
+  sedeSeleccionada = null;
   document.querySelectorAll(".vbtn").forEach((b) => b.classList.remove("sel"));
+  clearSelectedProduct();
+  document.getElementById("searchInput").value = "";
+  catalog = [];
+  setSearchEnabled(false);
+  setConnStatus(conectado, conectado
+    ? "Venta registrada — selecciona sede y vendedor para la próxima venta"
+    : "Sin conexión — venta pendiente. Selecciona sede y vendedor para la próxima venta");
   renderCart();
-
-  if (conectado) {
-    refreshCatalog().catch(() => {});
-  }
 }
 
 async function trySyncSale(venta) {
@@ -644,7 +760,7 @@ async function retryPendingSync() {
   renderPendingBanner();
   if (stillPending.length < pending.length) {
     toast("Ventas pendientes sincronizadas con Google Sheets.");
-    refreshCatalog().catch(() => {});
+    if (sedeSeleccionada) refreshCatalog(sedeSeleccionada).catch(() => {});
   }
 }
 
@@ -666,11 +782,12 @@ function generarReciboPDF(venta) {
   doc.text("Recibo de venta", 40, y, { align: "center" });
   y += 6;
   doc.text(`Fecha: ${venta.fecha}  ${venta.hora}`, 5, y); y += 5;
-  // El recibo NO muestra el nombre del vendedor: muestra la sede. Lo que se
-  // envía a Google Sheets (columna "Vendedor") sigue siendo el nombre real,
-  // sin cambios — esto solo afecta lo que ve el cliente en el PDF.
-  const sedeVendedor = SEDE_POR_VENDEDOR[venta.vendedor] || venta.vendedor;
-  doc.text(`Vendedor: ${sedeVendedor}`, 5, y); y += 5;
+  // El recibo NO muestra el nombre del vendedor: muestra la sede (marca
+  // pública, p.ej. "Papeltik Bogotá" en vez de "Suba" o "Colina"). Lo que se
+  // envía a Google Sheets (columnas "Vendedor" y "Ubicación") sigue siendo
+  // el dato real, sin cambios — esto solo afecta lo que ve el cliente en el PDF.
+  const sedeMostrada = SEDE_DISPLAY[venta.sede] || venta.sede;
+  doc.text(`Vendedor: ${sedeMostrada}`, 5, y); y += 5;
   doc.text(`Venta: ${venta.ventaId}`, 5, y); y += 3;
 
   doc.autoTable({
