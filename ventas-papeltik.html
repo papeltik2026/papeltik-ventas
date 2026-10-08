@@ -52,6 +52,7 @@
     font-size:13px;font-weight:600;color:var(--ink);cursor:pointer;text-align:center;
     transition:background .12s,border-color .12s,color .12s;}
   .modo-btn.sel{background:var(--teal-dark);border-color:var(--teal-dark);color:#fff;}
+  .modo-btn:disabled{opacity:.45;cursor:not-allowed;}
   .search-wrap{position:relative;}
   .results{position:absolute;left:0;right:0;top:calc(100% + 4px);background:#fff;
     border:1.5px solid var(--line);border-radius:10px;max-height:260px;overflow-y:auto;
@@ -430,7 +431,7 @@ function loadFallbackCatalog(sede) {
 function setSearchEnabled(enabled) {
   const input = document.getElementById("searchInput");
   input.disabled = !enabled;
-  input.placeholder = enabled ? "Buscar producto…" : "Primero selecciona un vendedor…";
+  input.placeholder = enabled ? "Buscar producto…" : "Primero selecciona la sede…";
   if (!enabled) {
     document.getElementById("searchResults").style.display = "none";
   }
@@ -507,12 +508,21 @@ function selectProduct(p) {
   let meta = `Existencias: ${fmtNum(p.disponible)} · $${fmtNum(p.precio)} c/u`;
   if (puedePaquete) {
     meta += ` · Paquete (${fmtNum(p.cantUnitPorPaquete)} u): $${fmtNum(p.tarifaPaquete)}`;
+  } else {
+    meta += ` · Sin precio de paquete en esta sede`;
   }
   document.getElementById("spMeta").textContent = meta;
 
+  // El selector Unidad/Paquete SIEMPRE se muestra al elegir un producto; si
+  // el producto no tiene datos de paquete (Cant. Unit o Tarifa Paquete vacíos
+  // en Inventario, o catálogo sin conexión), el botón "Paquete" queda
+  // deshabilitado en vez de desaparecer, para que se vea por qué.
   const toggle = document.getElementById("modoToggle");
-  toggle.style.display = puedePaquete ? "grid" : "none";
-  toggle.querySelectorAll(".modo-btn").forEach((b) => b.classList.toggle("sel", b.dataset.modo === "unidad"));
+  toggle.style.display = "grid";
+  toggle.querySelectorAll(".modo-btn").forEach((b) => {
+    b.classList.toggle("sel", b.dataset.modo === "unidad");
+    if (b.dataset.modo === "paquete") b.disabled = !puedePaquete;
+  });
 
   document.getElementById("qtyInput").value = 1;
   actualizarEtiquetaCantidad();
